@@ -1,0 +1,5 @@
+streamlit>=1.60
+pandas
+fpdf2>=2.8
+# Facultatif : pour dessiner le schéma dans le PDF (nécessite aussi le logiciel Graphviz)
+graphviz
