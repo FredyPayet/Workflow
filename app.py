@@ -190,7 +190,7 @@ def restaurer_de_la_corbeille(nom_fichier: str) -> None:
 #     {
 #       "id": "...", "nom": "...", "metier": "Administratif" | "Technique",
 #       "note": "...",
-#       "sous_etapes": [ {"id": "...", "nom": "...", "note": "..."} ],
+#       "sous_etapes": [ {"id": "...", "nom": "...", "description": "..."} ],
 #       "sortie": "parallele" | "alternative",   (utile si plusieurs liens)
 #       "liens": [ {"id": "...", "cible": "<id tâche suivante>",
 #                   "delai": 2, "unite": "jour" | "semaine" | "mois",
@@ -212,8 +212,8 @@ def nouvelle_tache(nom: str, metier: str = "Administratif") -> dict:
             "sous_etapes": [], "sortie": "parallele", "liens": []}
 
 
-def nouvelle_sous_etape(nom: str) -> dict:
-    return {"id": nouvel_id(), "nom": nom.strip(), "note": ""}
+def nouvelle_sous_etape(nom: str, description: str = "") -> dict:
+    return {"id": nouvel_id(), "nom": nom.strip(), "description": description}
 
 
 def nouveau_lien(cible: str, delai: int = 1, unite: str = "jour", condition: str = "") -> dict:
@@ -253,7 +253,8 @@ def normaliser_workflow(donnees) -> dict:
                 sous_etapes.append({
                     "id": s["id"] if id_valide(s.get("id")) else nouvel_id(),
                     "nom": _texte(s.get("nom"), "Sous-étape sans nom"),
-                    "note": str(s.get("note") or ""),
+                    # « note » = ancien nom du champ (fichiers exportés avant la version 2)
+                    "description": str(s.get("description") or s.get("note") or ""),
                 })
 
         liens = []
@@ -313,11 +314,14 @@ def workflow_exemple() -> dict:
                           "Exemple pour découvrir l'application. Vous pouvez le modifier ou le supprimer.")
     t1 = nouvelle_tache("Création du lot", "Administratif")
     t1["note"] = "Le magasinier enregistre le lot dès son arrivée.\n- Vérifier le bon de livraison\n- Noter le numéro fournisseur"
-    t1["sous_etapes"] = [nouvelle_sous_etape("Saisir la référence fournisseur"),
-                         nouvelle_sous_etape("Attribuer un numéro de lot")]
+    t1["sous_etapes"] = [
+        nouvelle_sous_etape("Saisir la référence fournisseur",
+                            "Reprendre la référence indiquée sur le bon de livraison.\nEn cas de doute, appeler le fournisseur."),
+        nouvelle_sous_etape("Attribuer un numéro de lot", "Format : AAAA-MM-numéro (ex. 2026-10-042)."),
+    ]
     t2 = nouvelle_tache("Contrôle qualité", "Technique")
     t2["note"] = "Contrôle par prélèvement d'échantillons au laboratoire."
-    t2["sous_etapes"] = [nouvelle_sous_etape("Prélever les échantillons"),
+    t2["sous_etapes"] = [nouvelle_sous_etape("Prélever les échantillons", "3 échantillons par palette, au hasard."),
                          nouvelle_sous_etape("Analyser au laboratoire"),
                          nouvelle_sous_etape("Rédiger le rapport de contrôle")]
     t3 = nouvelle_tache("Mise en stock", "Technique")
@@ -357,12 +361,16 @@ def _nombre(x: float) -> str:
     return str(int(x)) if x == int(x) else str(x).replace(".", ",")
 
 
+def en_mois(j: int) -> str:
+    """Convertit des jours en mois (1 mois = 30 jours) : « 2,6 mois »."""
+    if 0 < j < 3:  # moins de 0,1 mois : on évite d'afficher « 0 mois »
+        return "< 0,1 mois"
+    return f"{_nombre(j / 30)} mois"
+
+
 def formater_jours(j: int) -> str:
-    if j < 7:
-        return f"{j} jour{'s' if j > 1 else ''}"
-    if j < 30:
-        return f"{j} jours (≈ {_nombre(j / 7)} sem.)"
-    return f"{j} jours (≈ {_nombre(j / 30)} mois)"
+    """« 2,6 mois (79 jours) »"""
+    return f"{en_mois(j)} ({j} jour{'s' if j > 1 else ''})"
 
 
 def calculer_durees(wf: dict):
@@ -458,6 +466,37 @@ def _couper(texte: str, largeur: int = 24) -> str:
     return "\n".join(textwrap.wrap(texte, largeur)) or texte
 
 
+def _html(texte: str, largeur: int = 28) -> str:
+    """Protège un texte pour un bloc « HTML » Graphviz et le coupe en lignes alignées à gauche."""
+    morceaux = textwrap.wrap(str(texte), largeur) or [str(texte)]
+    proteger = lambda m: m.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return '<BR ALIGN="LEFT"/>'.join(proteger(m) for m in morceaux) + '<BR ALIGN="LEFT"/>'
+
+
+def bloc_tache_html(t: dict, numero: int, surligne: bool = False) -> str:
+    """Dessine une tâche sous forme de carte : en-tête (nom + métier), puis ses sous-étapes."""
+    style = STYLE_METIER[t["metier"]]
+    bordure = 4 if surligne else 2
+    titre = f"T{numero} · {t['nom']}"
+    lignes = [
+        f'<TABLE BORDER="{bordure}" STYLE="ROUNDED" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" '
+        f'BGCOLOR="{style["fond"]}" COLOR="{style["bord"]}">',
+        f'<TR><TD ALIGN="LEFT" BALIGN="LEFT"><B>{_html(titre, 26)}</B></TD></TR>',
+        f'<TR><TD ALIGN="LEFT"><FONT POINT-SIZE="10" COLOR="#334155">{_html(t["metier"])}</FONT></TD></TR>',
+    ]
+    if t["sous_etapes"]:
+        lignes.append("<HR/>")
+        for j, s in enumerate(t["sous_etapes"], start=1):
+            marque = " (+ description)" if s["description"].strip() else ""
+            texte = f"{numero}.{j}  {s['nom']}{marque}"
+            lignes.append(
+                f'<TR><TD ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="white"><FONT POINT-SIZE="10">'
+                f'{_html(texte, 32)}</FONT></TD></TR>'
+            )
+    lignes.append("</TABLE>")
+    return "".join(lignes)
+
+
 def schema_workflow(wf: dict, surligner: str = None, pour_image: bool = False):
     """Schéma de tout le workflow : Début → tâches → Fin, avec délais, OU et ET."""
     taches = wf["taches"]
@@ -478,15 +517,8 @@ def schema_workflow(wf: dict, surligner: str = None, pour_image: bool = False):
     entrants = {l["cible"] for t in taches for l in t["liens"]}
 
     for i, t in enumerate(taches, start=1):
-        style = STYLE_METIER[t["metier"]]
-        nb = len(t["sous_etapes"])
-        detail = t["metier"] + (f" · {nb} sous-étape{'s' if nb > 1 else ''}" if nb else "")
-        etiquette = f"T{i} · {_couper(t['nom'])}\n{detail}"
-        epaisseur = 3.5 if t["id"] == surligner else 1.5
-        lignes.append(
-            f'"{t["id"]}" [label="{_dot(etiquette)}", shape=box, style="rounded,filled", '
-            f'fillcolor="{style["fond"]}", color="{style["bord"]}", penwidth={epaisseur}, margin="0.2,0.1"];'
-        )
+        # Bloc de tâche : titre, métier, puis la liste des sous-étapes en dessous
+        lignes.append(f'"{t["id"]}" [shape=plain, label=<{bloc_tache_html(t, i, t["id"] == surligner)}>];')
 
     departs = [t for t in taches if t["id"] not in entrants] or taches[:1]
     for t in departs:
@@ -696,11 +728,11 @@ def generer_pdf(wf: dict) -> bytes:
             pdf.paragraphe(f"Sous-étapes ({len(t['sous_etapes'])}) :", gras=True)
             for j, s in enumerate(t["sous_etapes"], start=1):
                 pdf.paragraphe(f"   {i}.{j}  {s['nom']}")
-                if s["note"].strip():
+                if s["description"].strip():
                     pdf.set_x(pdf.l_margin + 10)
                     pdf.set_font(pdf.police, "", 9.5)
                     pdf.set_text_color(100, 116, 139)
-                    pdf.multi_cell(pdf.epw - 10, 5, pdf.t(s["note"]), new_x="LMARGIN", new_y="NEXT")
+                    pdf.multi_cell(pdf.epw - 10, 5, pdf.t(s["description"]), new_x="LMARGIN", new_y="NEXT")
         pdf.paragraphe(texte_suite(wf, t).replace("→", "->"), gris=True)
 
     return bytes(pdf.output())
@@ -1058,7 +1090,9 @@ def injecter_style():
     st.markdown(f"""
     <style>
       html, body, [data-testid="stAppViewContainer"] {{ font-size: 16px; }}
-      .block-container {{ padding-top: 2rem; max-width: 1200px; }}
+      .block-container {{ padding: 2rem 2.5rem 3rem; max-width: 100% !important; }}
+      @media (max-width: 640px) {{ .block-container {{ padding: 1.5rem 1rem 2rem; }} }}
+      [data-testid="stPopover"] button {{ min-height: 44px; min-width: 44px; }}
       .stButton button, .stDownloadButton button, .stFormSubmitButton button {{
           min-height: 44px; border-radius: 10px; font-size: 1rem;
       }}
@@ -1241,8 +1275,10 @@ def page_workflow(wf: dict):
     m1.metric("📄 Tâches administratives", c["Administratif"]["taches"], border=True)
     m2.metric("🔧 Tâches techniques", c["Technique"]["taches"], border=True)
     m3.metric("🧩 Sous-étapes", sum(v["sous_etapes"] for v in c.values()), border=True)
-    m4.metric("⏱️ Durée estimée", (f"{maxi} j" if mini == maxi else f"{mini} à {maxi} j") if wf["taches"] else "—",
-              border=True, help="Somme des délais du chemin le plus long. 1 semaine = 7 jours, 1 mois = 30 jours. "
+    valeur_duree = en_mois(maxi) if mini == maxi else f"{_nombre(mini / 30)} à {en_mois(maxi)}"
+    m4.metric("⏱️ Durée totale estimée", valeur_duree if wf["taches"] else "—",
+              border=True, help=f"Soit {mini if mini == maxi else f'{mini} à {maxi}'} jours. "
+                                "Somme des délais du chemin le plus long. 1 semaine = 7 jours, 1 mois = 30 jours. "
                                 "Avec des choix (OU), on affiche la durée la plus courte et la plus longue.")
     if boucle:
         st.info("Ce workflow contient une boucle (retour à une tâche précédente) : "
@@ -1287,6 +1323,20 @@ def page_workflow(wf: dict):
                           disabled=i == 1, width="stretch", help="Monter la tâche dans la liste")
                 b3.button("▼ Descendre", key=f"b_{t['id']}", on_click=deplacer_tache, args=(t["id"], 1),
                           disabled=i == total, width="stretch", help="Descendre la tâche dans la liste")
+            afficher_sous_etapes(t, i)
+
+
+def afficher_sous_etapes(t: dict, numero: int):
+    """Liste des sous-étapes sous la tâche. L'icône 💬 ouvre la description."""
+    for j, s in enumerate(t["sous_etapes"], start=1):
+        ligne = st.container(horizontal=True, vertical_alignment="center", gap="small")
+        ligne.markdown(f"<span style='color:#334155'>↳ <strong>{numero}.{j}</strong> {echapper(s['nom'])}</span>",
+                       unsafe_allow_html=True, width="content")
+        if s["description"].strip():
+            with ligne.popover("💬", help=f"Voir la description de la sous-étape {numero}.{j}"):
+                st.markdown(f"**{numero}.{j} · {echapper(s['nom'])}**")
+                # Texte affiché tel qu'il a été saisi (retours à la ligne conservés)
+                st.markdown(echapper(s["description"]).replace("\n", "  \n"))
 
 
 # ---- Écran 3 : zoom sur une tâche -----------------------------------
@@ -1355,12 +1405,13 @@ def page_tache(wf: dict, t: dict):
         nb = len(t["sous_etapes"])
         for j, s in enumerate(t["sous_etapes"], start=1):
             sid = s["id"]
-            with st.expander(f"{n}.{j} · {s['nom']}" + (" 📝" if s["note"].strip() else ""), expanded=False):
+            with st.expander(f"{n}.{j} · {s['nom']}" + (" 💬" if s["description"].strip() else ""), expanded=False):
                 st.text_input("Nom de la sous-étape", value=s["nom"], key=f"s_nom_{sid}_{rev}",
                               on_change=cb_champ_sous_etape, args=(tid, sid, "nom", f"s_nom_{sid}_{rev}"))
-                st.text_area("Note", value=s["note"], height=130, key=f"s_note_{sid}_{rev}",
+                st.text_area("Description", value=s["description"], height=130, key=f"s_desc_{sid}_{rev}",
+                             help="Visible en cliquant sur l'icône 💬 dans la liste des tâches, et recopiée telle quelle dans le PDF.",
                              placeholder="Détails, documents utiles, points de contrôle…",
-                             on_change=cb_champ_sous_etape, args=(tid, sid, "note", f"s_note_{sid}_{rev}"))
+                             on_change=cb_champ_sous_etape, args=(tid, sid, "description", f"s_desc_{sid}_{rev}"))
                 b1, b2, b3 = st.columns(3)
                 b1.button("▲ Monter", key=f"sh_{sid}", on_click=deplacer_sous_etape, args=(tid, sid, -1),
                           disabled=j == 1, width="stretch")
