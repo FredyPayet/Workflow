@@ -23,8 +23,8 @@ Organisation du code (dans l'ordre du fichier) :
     2. Stockage des fichiers (sauvegarde, corbeille)
     3. Modèle de données (création, contrôle des fichiers importés)
     4. Calculs (durées, récapitulatif)
-    5. Schémas (Graphviz)
-    6. Export PDF
+    5. Schémas affichés dans l'application
+    6. Export PDF (schéma dessiné directement, sans logiciel à installer)
     7. Historique « Annuler »
     8. Actions (fonctions appelées par les boutons)
     9. Fenêtres de confirmation
@@ -33,7 +33,6 @@ Organisation du code (dans l'ordre du fichier) :
 """
 
 import copy
-import io
 import json
 import os
 import re
@@ -573,18 +572,6 @@ def schema_sous_etapes(t: dict):
     return "\n".join(lignes)
 
 
-def image_schema(dot: str):
-    """Transforme le schéma en image PNG pour le PDF.
-    Nécessite le logiciel Graphviz installé sur l'ordinateur ; sinon renvoie None."""
-    try:
-        import graphviz  # bibliothèque Python facultative
-        if not shutil.which("dot"):
-            return None
-        return graphviz.Source(dot).pipe(format="png")
-    except Exception:
-        return None
-
-
 # =====================================================================
 # 6. EXPORT PDF
 # =====================================================================
@@ -667,6 +654,303 @@ class PDFWorkflow(FPDF):
         self.multi_cell(0, 5.5, self.t(texte), new_x="LMARGIN", new_y="NEXT")
 
 
+# ---- Schéma dessiné directement dans le PDF --------------------------
+# Aucun logiciel à installer : le schéma est calculé puis tracé avec les
+# outils de dessin du PDF (rectangles, losanges, flèches).
+# Principe : Début, puis chaque tâche reçoit une « colonne » selon sa place
+# dans l'enchaînement ; les tâches d'une même colonne sont empilées.
+
+ECART_COLONNES = 34    # mm entre deux colonnes (place pour le texte des flèches)
+ECART_LIGNES = 8       # mm entre deux blocs d'une même colonne
+LARGEUR_TACHE = 54     # mm
+TAILLE_TITRE, TAILLE_PETIT, TAILLE_FLECHE = 9, 7.5, 7   # tailles de police (points)
+PT = 0.3528            # 1 point = 0,3528 mm
+INTERLIGNE = 1.35
+
+
+def _rvb(couleur: str):
+    """« #1A56DB » → (26, 86, 219)"""
+    couleur = couleur.lstrip("#")
+    return tuple(int(couleur[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _couper_pdf(pdf, texte: str, largeur: float, taille: float, gras: bool = False) -> list:
+    """Coupe un texte en lignes qui tiennent dans « largeur » (en mm)."""
+    pdf.set_font(pdf.police, "B" if gras else "", taille)
+    lignes = []
+    for paragraphe in pdf.t(texte).split("\n"):
+        ligne = ""
+        for mot in paragraphe.split(" "):
+            essai = f"{ligne} {mot}".strip()
+            if not ligne or pdf.get_string_width(essai) <= largeur:
+                ligne = essai
+            else:
+                lignes.append(ligne)
+                ligne = mot
+        lignes.append(ligne)
+    return lignes
+
+
+def _hauteur_ligne(taille: float) -> float:
+    return taille * PT * INTERLIGNE
+
+
+def disposer_schema(pdf, wf: dict):
+    """Calcule la position de chaque élément du schéma (en mm, à l'échelle 1)."""
+    taches = wf["taches"]
+    noeuds, fleches = {}, []
+
+    # 1. Les éléments : Début, les tâches (avec leurs sous-étapes), les losanges ET / OU
+    noeuds["debut"] = {"type": "debut", "w": 11, "h": 11, "ordre": -1}
+    texte_max = LARGEUR_TACHE - 6
+    for i, t in enumerate(taches, start=1):
+        titre = _couper_pdf(pdf, f"T{i} · {t['nom']}", texte_max, TAILLE_TITRE, gras=True)
+        sous = []
+        for j, s in enumerate(t["sous_etapes"], start=1):
+            sous.append(_couper_pdf(pdf, f"{i}.{j}  {s['nom']}", texte_max, TAILLE_PETIT))
+        h_entete = 3 + len(titre) * _hauteur_ligne(TAILLE_TITRE) + _hauteur_ligne(TAILLE_PETIT) + 1.5
+        nb_lignes_sous = sum(len(x) for x in sous)
+        h_sous = 2.5 + nb_lignes_sous * _hauteur_ligne(TAILLE_PETIT) + 1.5 * len(sous) if sous else 0
+        noeuds[t["id"]] = {"type": "tache", "tache": t, "titre": titre, "sous": sous, "h_entete": h_entete,
+                           "w": LARGEUR_TACHE, "h": h_entete + h_sous, "ordre": i}
+        if len(t["liens"]) > 1:
+            noeuds["porte_" + t["id"]] = {"type": "porte", "choix": t["sortie"] == "alternative",
+                                          "w": 10, "h": 10, "ordre": i + 0.5}
+
+    # 2. Les flèches
+    entrants = {l["cible"] for t in taches for l in t["liens"]}
+    departs = [t["id"] for t in taches if t["id"] not in entrants] or [taches[0]["id"]]
+    for d in departs:
+        fleches.append({"de": "debut", "vers": d, "texte": ""})
+    for t in taches:
+        if len(t["liens"]) == 1:
+            lien = t["liens"][0]
+            fleches.append({"de": t["id"], "vers": lien["cible"], "texte": libelle_delai(lien)})
+        elif t["liens"]:
+            porte = "porte_" + t["id"]
+            fleches.append({"de": t["id"], "vers": porte, "texte": ""})
+            for lien in t["liens"]:
+                texte = libelle_delai(lien)
+                if t["sortie"] == "alternative":
+                    texte = f"{lien['condition'] or 'Condition à préciser'}\n{texte}"
+                fleches.append({"de": porte, "vers": lien["cible"], "texte": texte})
+
+    # 3. Repérer les retours en arrière (boucles) et trier les éléments dans l'ordre du flux
+    sortantes = {n: [f for f in fleches if f["de"] == n] for n in noeuds}
+    etat, ordre_flux = {}, []
+
+    def parcourir(n):
+        etat[n] = "en_cours"
+        for f in sortantes[n]:
+            if etat.get(f["vers"]) == "en_cours":
+                f["retour"] = True
+            elif f["vers"] not in etat:
+                parcourir(f["vers"])
+        etat[n] = "fini"
+        ordre_flux.append(n)
+
+    for n in ["debut"] + [t["id"] for t in taches] + list(noeuds):
+        if n not in etat:
+            parcourir(n)
+    ordre_flux.reverse()
+
+    # 4. Colonne de chaque élément = longueur du plus long chemin depuis Début
+    for n in noeuds.values():
+        n["rang"] = 0
+    for n in ordre_flux:
+        for f in sortantes[n]:
+            if not f.get("retour"):
+                noeuds[f["vers"]]["rang"] = max(noeuds[f["vers"]]["rang"], noeuds[n]["rang"] + 1)
+
+    colonnes = [[] for _ in range(max(n["rang"] for n in noeuds.values()) + 1)]
+    for nid in sorted(noeuds, key=lambda k: noeuds[k]["ordre"]):
+        colonnes[noeuds[nid]["rang"]].append(nid)
+
+    def decalage_ancre(n):
+        """Hauteur où arrivent les flèches : milieu de l'en-tête pour une tâche."""
+        return n["h_entete"] / 2 if n["type"] == "tache" else n["h"] / 2
+
+    # 5. Positions : chaque colonne s'aligne sur l'élément qui la précède (lignes droites)
+    x = 0
+    for r, colonne in enumerate(colonnes):
+        if r:
+            def precedents(nid):
+                return [noeuds[f["de"]] for f in fleches if f["vers"] == nid and not f.get("retour")]
+            # ordre vertical : selon la position des éléments précédents (moins de croisements)
+            colonne.sort(key=lambda nid: (min((p["y"] for p in precedents(nid)), default=0), noeuds[nid]["ordre"]))
+            premier = noeuds[colonne[0]]
+            avant = precedents(colonne[0])
+            y = (avant[0]["y"] + decalage_ancre(avant[0]) - decalage_ancre(premier)) if avant else 0
+        else:
+            y = 0
+        largeur = max(noeuds[n]["w"] for n in colonne)
+        for nid in colonne:
+            n = noeuds[nid]
+            n["x"], n["y"] = x + (largeur - n["w"]) / 2, y
+            y += n["h"] + ECART_LIGNES
+        x += largeur + ECART_COLONNES
+
+    # 6. On recale le tout pour que le haut du schéma soit à 0
+    y_min = min(n["y"] for n in noeuds.values())
+    for n in noeuds.values():
+        n["y"] -= y_min
+        n["ancre"] = n["y"] + decalage_ancre(n)
+    hauteur = max(n["y"] + n["h"] for n in noeuds.values())
+    retours = [f for f in fleches if f.get("retour")]
+    for k, f in enumerate(retours):  # les boucles passent sous le schéma
+        f["y_retour"] = hauteur + 6 + 5 * k
+    if retours:
+        hauteur += 8 + 5 * len(retours)
+    largeur_totale = x - ECART_COLONNES + 16  # + place pour les marques « Fin »
+    return noeuds, fleches, largeur_totale, hauteur
+
+
+def dessiner_schema_pdf(pdf, wf: dict) -> None:
+    """Ajoute une page avec le schéma du workflow, mis à l'échelle pour tenir sur la page."""
+    noeuds, fleches, W, H = disposer_schema(pdf, wf)
+
+    # Échelle : on réduit pour tenir sur une page A4 paysage ; si le texte deviendrait
+    # trop petit (gros workflow), on agrandit la page au lieu de réduire davantage.
+    marge, haut_titre, bas = 15, 30, 18
+    e = min(1.0, (297 - 2 * marge) / W, (210 - haut_titre - bas) / H)
+    if e < 0.6:
+        e = 0.6
+        pdf.add_page(format=(max(297, W * e + 2 * marge), max(210, H * e + haut_titre + bas)))
+    else:
+        pdf.add_page(orientation="L", format="A4")
+    pdf.titre("Schéma du workflow", 13)
+    pdf.set_auto_page_break(False)
+
+    ox = pdf.l_margin + (pdf.epw - W * e) / 2
+    oy = pdf.get_y() + 4
+
+    def X(x):
+        return ox + x * e
+
+    def Y(y):
+        return oy + y * e
+
+    def ecrire(lignes, x, y_haut, taille, gras=False, couleur="#1F2937", centre_largeur=None):
+        """Écrit des lignes de texte ; y_haut = haut de la première ligne (coordonnées du schéma)."""
+        pdf.set_font(pdf.police, "B" if gras else "", taille * e)
+        pdf.set_text_color(*_rvb(couleur))
+        for k, ligne in enumerate(lignes):
+            base = y_haut + k * _hauteur_ligne(taille) + taille * PT * 1.0
+            decal = (centre_largeur * e - pdf.get_string_width(ligne)) / 2 if centre_largeur else 0
+            pdf.text(X(x) + decal, Y(base), ligne)
+
+    def pointe(x, y, sens="droite"):
+        """Petite pointe de flèche pleine."""
+        L, l = 2.4, 1.3
+        if sens == "droite":
+            points = [(x, y), (x - L, y - l), (x - L, y + l)]
+        else:  # vers le haut
+            points = [(x, y), (x - l, y + L), (x + l, y + L)]
+        pdf.polygon([(X(a), Y(b)) for a, b in points], style="F")
+
+    # --- Les flèches (dessinées d'abord, sous les blocs) ---
+    gris = _rvb("#475569")
+    pdf.set_draw_color(*gris)
+    pdf.set_fill_color(*gris)
+    pdf.set_line_width(0.35 * e)
+    for f in fleches:
+        a, b = noeuds[f["de"]], noeuds[f["vers"]]
+        if f.get("retour"):
+            # Boucle : on descend sous le schéma, on revient en arrière, on remonte
+            sx, tx, yr = a["x"] + a["w"] / 2, b["x"] + b["w"] / 2, f["y_retour"]
+            points = [(sx, a["y"] + a["h"]), (sx, yr), (tx, yr), (tx, b["y"] + b["h"] + 0.3)]
+            pdf.polyline([(X(p), Y(q)) for p, q in points])
+            pdf.set_fill_color(*gris)
+            pointe(tx, b["y"] + b["h"], "haut")
+            if f["texte"]:
+                lignes = _couper_pdf(pdf, f["texte"] + " (retour)", 40, TAILLE_FLECHE)
+                ecrire(lignes, min(sx, tx) + 3, yr - len(lignes) * _hauteur_ligne(TAILLE_FLECHE) - 0.6,
+                       TAILLE_FLECHE, couleur="#334155")
+            continue
+
+        sx, sy = a["x"] + a["w"], a["ancre"]
+        tx = b["x"]
+        haut_cible = b["y"] + (b["h_entete"] if b["type"] == "tache" else b["h"])
+        if b["y"] + 1 <= sy <= haut_cible - 1:   # même hauteur : flèche droite
+            ty, points, debut_texte = sy, [(sx, sy), (tx, sy)], sx + 1.5
+        else:                                    # sinon : flèche coudée
+            ty, xm = b["ancre"], sx + 5
+            points, debut_texte = [(sx, sy), (xm, sy), (xm, ty), (tx, ty)], xm + 1.5
+        pdf.polyline([(X(p), Y(q)) for p, q in points])
+        pointe(tx, ty)
+        if f["texte"]:
+            lignes = _couper_pdf(pdf, f["texte"], max(10, tx - debut_texte - 3), TAILLE_FLECHE)
+            ecrire(lignes, debut_texte, ty - len(lignes) * _hauteur_ligne(TAILLE_FLECHE) - 0.6,
+                   TAILLE_FLECHE, couleur="#334155")
+
+    # --- Les blocs ---
+    for nid, n in noeuds.items():
+        x, y, w, h = n["x"], n["y"], n["w"], n["h"]
+        if n["type"] == "debut":
+            pdf.set_line_width(0.5 * e)
+            pdf.set_draw_color(*_rvb("#15803D"))
+            pdf.set_fill_color(*_rvb("#DCFCE7"))
+            pdf.ellipse(X(x), Y(y), w * e, h * e, style="DF")
+            ecrire([pdf.t("Début")], x, y + h / 2 - 1.6, 6.5, gras=True, centre_largeur=w)
+
+        elif n["type"] == "porte":
+            bord, fond = ("#A16207", "#FEF9C3") if n["choix"] else ("#4338CA", "#E0E7FF")
+            pdf.set_line_width(0.5 * e)
+            pdf.set_draw_color(*_rvb(bord))
+            pdf.set_fill_color(*_rvb(fond))
+            pdf.polygon([(X(x + w / 2), Y(y)), (X(x + w), Y(y + h / 2)), (X(x + w / 2), Y(y + h)), (X(x), Y(y + h / 2))],
+                        style="DF")
+            ecrire(["OU" if n["choix"] else "ET"], x, y + h / 2 - 1.7, 7, gras=True, centre_largeur=w)
+
+        else:  # tâche : en-tête coloré + sous-étapes sur fond blanc
+            t = n["tache"]
+            style = STYLE_METIER[t["metier"]]
+            rayon = 2.2 * e
+            pdf.set_line_width(0.6 * e)
+            pdf.set_draw_color(*_rvb(style["bord"]))
+            pdf.set_fill_color(255, 255, 255)
+            pdf.rect(X(x), Y(y), w * e, h * e, style="F", round_corners=True, corner_radius=rayon)
+            pdf.set_fill_color(*_rvb(style["fond"]))
+            pdf.rect(X(x), Y(y), w * e, n["h_entete"] * e, style="F", round_corners=True, corner_radius=rayon)
+            if n["sous"]:  # coins du bas de l'en-tête bien droits + trait de séparation
+                pdf.rect(X(x), Y(y + n["h_entete"]) - rayon, w * e, rayon, style="F")
+                pdf.line(X(x), Y(y + n["h_entete"]), X(x + w), Y(y + n["h_entete"]))
+            pdf.rect(X(x), Y(y), w * e, h * e, style="D", round_corners=True, corner_radius=rayon)
+
+            y_texte = y + 2.5
+            ecrire(n["titre"], x + 3, y_texte, TAILLE_TITRE, gras=True)
+            y_texte += len(n["titre"]) * _hauteur_ligne(TAILLE_TITRE)
+            ecrire([pdf.t(t["metier"])], x + 3, y_texte, TAILLE_PETIT, couleur="#334155")
+            y_texte = y + n["h_entete"] + 2
+            for lignes in n["sous"]:
+                ecrire(lignes, x + 3, y_texte, TAILLE_PETIT)
+                y_texte += len(lignes) * _hauteur_ligne(TAILLE_PETIT) + 1.5
+
+            if not t["liens"]:  # dernière tâche d'un chemin : marque « Fin » juste à droite
+                xf, yf = x + w, n["ancre"]
+                pdf.set_draw_color(*gris)
+                pdf.set_fill_color(*gris)
+                pdf.set_line_width(0.35 * e)
+                pdf.line(X(xf), Y(yf), X(xf + 6), Y(yf))
+                pointe(xf + 6, yf)
+                pdf.set_line_width(0.5 * e)
+                pdf.set_draw_color(*_rvb("#B91C1C"))
+                pdf.set_fill_color(*_rvb("#FEE2E2"))
+                pdf.ellipse(X(xf + 6.2), Y(yf - 4), 8 * e, 8 * e, style="DF")
+                pdf.ellipse(X(xf + 6.9), Y(yf - 3.3), 6.6 * e, 6.6 * e, style="D")
+                ecrire([pdf.t("Fin")], xf + 6.2, yf - 1.5, 6, gras=True, couleur="#7F1D1D", centre_largeur=8)
+
+    # Légende sous le schéma
+    pdf.set_xy(pdf.l_margin, Y(H) + 6)
+    pdf.set_text_color(100, 116, 139)
+    pdf.set_font(pdf.police, "", 8.5)
+    pdf.multi_cell(0, 4.5, pdf.t("Lecture : bleu = Administratif, orange = Technique (le métier est aussi écrit "
+                                 "dans chaque bloc). Losange OU = un seul chemin selon une condition ; losange ET = "
+                                 "tâches lancées en même temps. Le texte sur les flèches indique le délai."),
+                   new_x="LMARGIN", new_y="NEXT")
+    pdf.set_auto_page_break(True, margin=16)
+
+
 def generer_pdf(wf: dict) -> bytes:
     """Crée le PDF complet du workflow : synthèse, schéma, détail des tâches."""
     pdf = PDFWorkflow(f"Workflow : {wf['nom']}")
@@ -697,20 +981,12 @@ def generer_pdf(wf: dict) -> bytes:
             for valeur in r:
                 ligne.cell(pdf.t(valeur).strip())
 
-    # --- Page 2 : schéma (format paysage) ---
-    dot = schema_workflow(wf, pour_image=True)
-    if dot:
-        png = image_schema(dot)
-        pdf.add_page(orientation="L")
-        pdf.titre("Schéma du workflow", 13)
-        if png:
-            pdf.image(io.BytesIO(png), x=pdf.l_margin, w=pdf.epw, h=pdf.eph - 22, keep_aspect_ratio=True)
-        else:
-            pdf.paragraphe("Le schéma n'a pas pu être dessiné : installez le logiciel Graphviz sur "
-                           "l'ordinateur (voir le fichier LISEZMOI) pour l'ajouter au PDF.", gris=True)
+    # --- Page 2 : schéma, dessiné directement dans le PDF (aucun logiciel à installer) ---
+    if wf["taches"]:
+        dessiner_schema_pdf(pdf, wf)
 
     # --- Pages suivantes : détail de chaque tâche ---
-    pdf.add_page(orientation="P")
+    pdf.add_page(orientation="P", format="A4")
     pdf.titre("Détail des tâches", 15)
     if not wf["taches"]:
         pdf.paragraphe("Ce workflow ne contient encore aucune tâche.", gris=True)
